@@ -39,19 +39,20 @@ jobs:
           GCP_STAGING_BUCKET: ${{ secrets.GCP_STAGING_BUCKET || 'hubscape-geap-reasoning-engines' }}
         run: |
           REPO_DIR="$(basename "$(pwd)")"
+          NORM_DIR="$(echo "$REPO_DIR" | tr '-' '_')"
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             PARENT_DIR="$(cd .. && pwd)"
             cp "$GOOGLE_APPLICATION_CREDENTIALS" "$PARENT_DIR/gha-creds-temp.json"
             export GOOGLE_APPLICATION_CREDENTIALS="$PARENT_DIR/gha-creds-temp.json"
           fi
           cd ..
-          mv "$REPO_DIR" space_agent
-          cd space_agent
+          mv "$REPO_DIR" "$NORM_DIR"
+          cd "$NORM_DIR"
           echo "from app.core.agent_runtime_app import agent_runtime, AgentEngineApp" > app/agent_runtime_app.py
           export PYTHONPATH="$(pwd)"
           python deploy.py
           cd ..
-          mv space_agent "$REPO_DIR"
+          mv "$NORM_DIR" "$REPO_DIR"
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
           fi

@@ -245,7 +245,8 @@ class AgentEngineApp(AdkApp):
         org_id = (context or {}).get("orgId") or (context or {}).get("org_id")
         hub_id = (context or {}).get("hubId") or (context or {}).get("hub_id")
         
-        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/Zco-AI-Labs/host-agent"))
+        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
+        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
         from app.app_utils.env_resolver import get_project_id
         project_id = get_project_id()
         
@@ -376,7 +377,8 @@ class AgentEngineApp(AdkApp):
         org_id = (context or {}).get("orgId") or (context or {}).get("org_id")
         hub_id = (context or {}).get("hubId") or (context or {}).get("hub_id")
         
-        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/Zco-AI-Labs/host-agent"))
+        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
+        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
         from app.app_utils.env_resolver import get_project_id
         project_id = get_project_id()
         
@@ -483,10 +485,14 @@ class AgentEngineApp(AdkApp):
             except Exception as e:
                 print(f"⚠️ Warning: Failed to parse permissions.json: {e}")
 
+        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
+        agent_desc = root_agent.description if root_agent and hasattr(root_agent, "description") else "Space Agent"
         card_dict = {
-            "name": getattr(root_agent, "name", "host-agent"),
-            "description": getattr(root_agent, "description", "Host orchestrator agent."),
+            "name": agent_name,
+            "description": agent_desc,
             "version": "0.1.0",
+            "protocolVersion": "0.3.0",
+            "preferredTransport": "HTTP+JSON",
             "capabilities": {
                 "streaming": False,
                 "extensions": [
@@ -500,6 +506,13 @@ class AgentEngineApp(AdkApp):
                     }
                 ]
             },
+            "skills": [
+                {
+                    "id": agent_name,
+                    "name": agent_name,
+                    "description": agent_desc
+                }
+            ],
             "tools": []
         }
         
