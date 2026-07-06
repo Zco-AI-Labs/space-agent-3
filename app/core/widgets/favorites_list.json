@@ -1,0 +1,28 @@
+{
+  "type": "container",
+  "props": {
+    "className": "flex flex-col gap-4 p-4 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800"
+  },
+  "children": [
+    {
+      "type": "text",
+      "props": {
+        "text": "Your Favorite Space Pictures",
+        "className": "text-lg font-bold text-slate-900 dark:text-white"
+      }
+    },
+    {
+      "type": "table",
+      "props": {
+        "paginated": true,
+        "pageSize": 5,
+        "columns": [
+          { "key": "date", "name": "Date", "width": "25%" },
+          { "key": "title", "name": "Title", "width": "50%" },
+          { "key": "actions", "name": "Actions", "width": "25%" }
+        ],
+        "rows": "{{favorites_rows}}"
+      }
+    }
+  ]
+}

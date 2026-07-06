@@ -1,0 +1,45 @@
+{
+  "type": "container",
+  "props": {
+    "className": "flex flex-col gap-4 p-4 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800"
+  },
+  "children": [
+    {
+      "type": "text",
+      "props": {
+        "text": "{{title}}",
+        "className": "text-xl font-bold text-slate-900 dark:text-white"
+      }
+    },
+    {
+      "type": "text",
+      "props": {
+        "text": "Date: {{date}}",
+        "className": "text-xs text-slate-500 dark:text-slate-400 font-medium"
+      }
+    },
+    {
+      "type": "image",
+      "props": {
+        "src": "{{media_url}}",
+        "alt": "{{title}}",
+        "className": "w-full max-h-[400px] object-cover rounded-lg border border-slate-100 dark:border-slate-800"
+      }
+    },
+    {
+      "type": "text",
+      "props": {
+        "text": "{{explanation}}",
+        "className": "text-sm text-slate-700 dark:text-slate-300 leading-relaxed"
+      }
+    },
+    {
+      "type": "button",
+      "props": {
+        "label": "Save to Favorites",
+        "actionUrl": "agent://favorite_apod?date={{date}}&title={{title}}&media_url={{media_url}}&media_type=image",
+        "className": "bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-medium transition-colors"
+      }
+    }
+  ]
+}

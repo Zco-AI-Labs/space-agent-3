@@ -758,7 +758,7 @@ wheels = [
 ]
 
 [[package]]
-name = "host-agent"
+name = "space-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
