@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "ADMIN": "Allows administering the workspace hub, managing sub-agents, and deleting workspace resources.",
+    "MEMBER": "Allows standard operations like searching for agents and initiating conversations."
+  }
+}

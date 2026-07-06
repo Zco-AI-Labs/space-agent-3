@@ -1,0 +1,108 @@
+name: Deploy Agent to Hubscape
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  deploy:
+    name: Deploy to Hubscape Dev/Staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate config.json Structure
+        run: |
+          if [ ! -f config.json ]; then
+            echo "Error: config.json is missing!"
+            exit 1
+          fi
+          # Basic validation using python to ensure JSON is parseable
+          python3 -c "import json; data=json.load(open('config.json')); print('Config parsed successfully: ' + data.get('name', 'Unnamed Agent'))"
+
+      - name: Validate logic.py Existence
+        run: |
+          if [ ! -f logic.py ]; then
+            echo "Error: logic.py is missing!"
+            exit 1
+          fi
+
+      - name: Deploy to Hubscape API
+        env:
+          HUBSCAPE_API_URL: ${{ secrets.HUBSCAPE_API_URL || 'https://hubscape-b9558.web.app' }}
+          DEPLOY_TOKEN: ${{ secrets.HUBSCAPE_DEPLOY_TOKEN }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          if [ -z "$DEPLOY_TOKEN" ]; then
+            echo "Error: HUBSCAPE_DEPLOY_TOKEN repository secret is not set!"
+            exit 1
+          fi
+          
+          python3 -c '
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+          import sys
+          
+          try:
+              if not os.path.exists("config.json"):
+                  print("Error: config.json not found.")
+                  sys.exit(1)
+              with open("config.json", "r") as f:
+                  config = json.load(f)
+              
+              required_secrets = config.get("required_secrets", {})
+              
+              secrets_json = os.environ.get("SECRETS_JSON", "{}")
+              all_secrets = json.loads(secrets_json)
+              
+              payload_secrets = {}
+              for key in required_secrets.keys():
+                  if key in all_secrets:
+                      payload_secrets[key] = all_secrets[key]
+                      
+              payload = {
+                  "repo_url": "https://github.com/" + os.environ.get("GITHUB_REPOSITORY", ""),
+                  "commit_hash": os.environ.get("GITHUB_SHA", ""),
+                  "token": os.environ.get("DEPLOY_TOKEN", ""),
+                  "secrets": payload_secrets
+              }
+              
+              api_url = os.environ.get("HUBSCAPE_API_URL", "").rstrip("/")
+              deploy_url = api_url + "/api/admin/agents/deploy"
+              
+              print("Initiating deployment for repository: " + payload["repo_url"])
+              print("Commit hash: " + payload["commit_hash"])
+              print("Target API: " + deploy_url)
+              print("Mapped secrets: " + str(list(payload_secrets.keys())))
+              
+              req = urllib.request.Request(
+                  deploy_url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST"
+              )
+              
+              with urllib.request.urlopen(req) as res:
+                  status_code = res.getcode()
+                  body = res.read().decode("utf-8")
+                  print("HTTP Status Code: " + str(status_code))
+                  print("Response Body:")
+                  print(body)
+                  if status_code == 200:
+                      print("✅ Deployment successful!")
+                  else:
+                      print("❌ Deployment failed with status code " + str(status_code))
+                      sys.exit(1)
+                      
+          except urllib.error.HTTPError as e:
+              print("❌ Deployment failed (HTTP " + str(e.code) + "):")
+              print(e.read().decode("utf-8"))
+              sys.exit(1)
+          except Exception as e:
+              print("❌ Network or configuration error during deployment: " + str(e))
+              sys.exit(1)
+          '
