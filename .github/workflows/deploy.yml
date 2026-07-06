@@ -47,6 +47,7 @@ jobs:
           cd ..
           mv "$REPO_DIR" space_agent
           cd space_agent
+          echo "from app.core.agent_runtime_app import agent_runtime, AgentEngineApp" > app/agent_runtime_app.py
           export PYTHONPATH="$(pwd)"
           python deploy.py
           cd ..
