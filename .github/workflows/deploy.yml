@@ -38,17 +38,18 @@ jobs:
           GCP_LOCATION: ${{ vars.GCP_LOCATION || 'us-central1' }}
           GCP_STAGING_BUCKET: ${{ secrets.GCP_STAGING_BUCKET || 'hubscape-geap-reasoning-engines' }}
         run: |
+          REPO_DIR="$(basename "$(pwd)")"
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             PARENT_DIR="$(cd .. && pwd)"
             cp "$GOOGLE_APPLICATION_CREDENTIALS" "$PARENT_DIR/gha-creds-temp.json"
             export GOOGLE_APPLICATION_CREDENTIALS="$PARENT_DIR/gha-creds-temp.json"
           fi
           cd ..
-          mv host-agent host_agent
+          mv "$REPO_DIR" host_agent
           cd host_agent
           python deploy.py
           cd ..
-          mv host_agent host-agent
+          mv host_agent "$REPO_DIR"
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
           fi
