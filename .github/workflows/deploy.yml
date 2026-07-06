@@ -45,11 +45,12 @@ jobs:
             export GOOGLE_APPLICATION_CREDENTIALS="$PARENT_DIR/gha-creds-temp.json"
           fi
           cd ..
-          mv "$REPO_DIR" host_agent
-          cd host_agent
+          mv "$REPO_DIR" space_agent
+          cd space_agent
+          export PYTHONPATH="$(pwd)"
           python deploy.py
           cd ..
-          mv host_agent "$REPO_DIR"
+          mv space_agent "$REPO_DIR"
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
           fi

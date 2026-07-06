@@ -5,7 +5,7 @@ import shutil
 
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "hubscape-geap")
 LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-display_name = "host-agent"
+display_name = "space-agent"
 
 print(f"Deploying {display_name} via native agents-cli...")
 
