@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import sys
 import os
 # Ensure standard imports share the same module instance
 app_dir = os.path.dirname(os.path.abspath(__file__))
-if app_dir not in sys.path:
-    sys.path.insert(0, app_dir)
+parent_dir = os.path.dirname(app_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 # Extract pyopenssl and monkeypatch PyOpenSSLContext immediately to prevent context mutation errors
 try:
@@ -45,18 +47,27 @@ try:
 except Exception:
     pass
 
-
-
+import asyncio
 import logging
 from typing import Any, Optional, Dict, List, Union
 
+import nest_asyncio
 import vertexai
 from dotenv import load_dotenv
-from google.adk.artifacts import GcsArtifactService, InMemoryArtifactService
-from google.adk.sessions.in_memory_session_service import InMemorySessionService
-from google.cloud import logging as google_cloud_logging
-from vertexai.agent_engines.templates.adk import AdkApp
+from a2a.types import AgentCapabilities, AgentCard, AgentExtension, TransportProtocol
+from a2a.server.agent_execution import RequestContext
+from a2a.server.events.event_queue import EventQueue
 
+from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
+from google.adk.a2a.utils.agent_card_builder import AgentCardBuilder
+from google.adk.apps import App
+from google.adk.artifacts import GcsArtifactService, InMemoryArtifactService
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.cloud import logging as google_cloud_logging
+from vertexai.preview.reasoning_engines import A2aAgent
+
+from app.core import hubscape_adk
 from app.agent import app as adk_app
 from app.app_utils.telemetry import setup_telemetry
 from app.app_utils.typing import Feedback
@@ -64,8 +75,296 @@ from app.app_utils.typing import Feedback
 # Load environment variables from .env file at runtime
 load_dotenv()
 
+def _load_permissions() -> dict:
+    import json
+    permissions_data = {}
+    try:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(app_dir)
+        permissions_path = os.path.join(parent_dir, "permissions.json")
+        if os.path.exists(permissions_path):
+            with open(permissions_path, "r") as pf:
+                permissions_data = json.load(pf)
+    except Exception:
+        pass
+    return permissions_data
 
-class AgentEngineApp(AdkApp):
+class ActionInterceptingEventQueue(EventQueue):
+    def __init__(self, target_queue: EventQueue, remote_context):
+        super().__init__()
+        self.target_queue = target_queue
+        self.remote_context = remote_context
+        self.accumulated_text = ""
+        self.events = []
+        self.final_event = None
+        self.artifact_event = None
+
+    async def enqueue_event(self, event):
+        from a2a.types import TaskStatusUpdateEvent, TaskArtifactUpdateEvent
+        if isinstance(event, TaskStatusUpdateEvent):
+            if event.final:
+                self.final_event = event
+                return
+            
+            # Extract text to accumulate
+            if event.status and event.status.message and event.status.message.parts:
+                for part in event.status.message.parts:
+                    if hasattr(part, "text") and part.text:
+                        self.accumulated_text += part.text
+            
+            self.events.append(event)
+        elif isinstance(event, TaskArtifactUpdateEvent):
+            self.artifact_event = event
+        else:
+            # E.g. Task submitted event, enqueue immediately
+            await self.target_queue.enqueue_event(event)
+
+
+class AgentEngineA2aExecutor(A2aAgentExecutor):
+    """Custom A2A Executor that intercepts requests to inject RemoteContext."""
+    async def execute(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+    ):
+        import json
+        import uuid
+        from datetime import datetime, timezone
+        from app.agent import root_agent
+        
+        metadata = context.metadata or {}
+        
+        user_id_resolved = metadata.get("userId") or metadata.get("user_id") or "anonymous_user"
+        org_id = metadata.get("orgId") or metadata.get("org_id")
+        hub_id = metadata.get("hubId") or metadata.get("hub_id")
+        mode = metadata.get("mode") or "none"
+        
+        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
+        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
+        from app.app_utils.env_resolver import get_project_id
+        project_id = get_project_id()
+        
+        remote_ctx = hubscape_adk.RemoteContext(
+            user_id=user_id_resolved,
+            agent_id=agent_uuid,
+            org_id=org_id,
+            hub_id=hub_id,
+            project_id=project_id,
+            raw_context=metadata
+        )
+        
+        interceptor = ActionInterceptingEventQueue(event_queue, remote_ctx)
+        
+        base_instruction = root_agent.instruction or ""
+        
+        # Inject Active Session Context securely at the top of the prompt
+        session_context = f"""
+[ACTIVE SESSION CONTEXT]
+- User ID: {user_id_resolved}
+- Hub ID: {hub_id or 'none'}
+- Organization ID: {org_id or 'none'}
+- Interaction Mode: {mode}
+"""
+        
+        # Format and append accessible agents roster
+        accessible_agents = metadata.get("accessible_agents", [])
+        roster_str = ""
+        if accessible_agents:
+            roster_str = "\n=== AVAILABLE SUBAGENTS ROSTER ===\n" + "\n".join(
+                f"- {a.get('name')} (ID: {a.get('id')}): {a.get('description')}" for a in accessible_agents
+            ) + "\n"
+            
+        root_agent.instruction = f"{session_context}{roster_str}\n{base_instruction}"
+        
+        try:
+            # Enter the context session to ensure all Firestore calls in tools are authenticated
+            with hubscape_adk.context_session(remote_ctx):
+                await super().execute(context, interceptor)
+        finally:
+            root_agent.instruction = base_instruction
+
+        # Determine if there are actions to propagate
+        has_actions = bool(remote_ctx.actions)
+        if has_actions:
+            directive_payload = {}
+            for action in remote_ctx.actions:
+                atype = action.get("type")
+                payload = action.get("payload") or {}
+                if atype == "OPEN_AGENT_WIDGET":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "openAgentWidget",
+                        "parameters": {
+                            "widgetId": payload.get("widgetId"),
+                            "widgetConfig": payload.get("widgetConfig"),
+                            "data": payload.get("data") or {},
+                            "styling": payload.get("styling") or {},
+                            "userPreferences": payload.get("userPreferences") or {}
+                        },
+                        "message": interceptor.accumulated_text or "Displaying agent widget."
+                    }
+                    break
+                elif atype == "OPEN_ADMIN_WIDGET":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "openAdminWidget",
+                        "parameters": {
+                            "widgetType": payload.get("widgetType")
+                        },
+                        "message": interceptor.accumulated_text or "Opening admin widget."
+                    }
+                    break
+                elif atype == "SET_SUGGESTIONS":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "suggestQueries",
+                        "parameters": {
+                            "queries": action.get("queries") or []
+                        },
+                        "message": interceptor.accumulated_text or ""
+                    }
+                    break
+                elif atype == "SWITCH_HUB":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "switchHub",
+                        "parameters": {
+                            "hubId": payload.get("hubId")
+                        },
+                        "message": interceptor.accumulated_text or "Switching hub workspace."
+                    }
+                    break
+                elif atype == "OPEN_EXTERNAL_LINK":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "openExternalLink",
+                        "parameters": {
+                            "url": payload.get("url")
+                        },
+                        "message": interceptor.accumulated_text or "Opening link."
+                    }
+                    break
+                elif atype == "END_CALL":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "endCall",
+                        "parameters": {},
+                        "message": interceptor.accumulated_text or "Call ended."
+                    }
+                    break
+
+            if directive_payload:
+                from a2a.types import TaskStatusUpdateEvent, Message, Role, TextPart, TaskStatus, TaskState, TaskArtifactUpdateEvent, Artifact
+                
+                json_text = json.dumps(directive_payload)
+                new_event = TaskStatusUpdateEvent(
+                    task_id=context.task_id,
+                    status=TaskStatus(
+                        state=TaskState.working,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        message=Message(
+                            message_id=str(uuid.uuid4()),
+                            role=Role.agent,
+                            parts=[TextPart(text=json_text)]
+                        )
+                    ),
+                    context_id=context.context_id,
+                    final=False
+                )
+                await event_queue.enqueue_event(new_event)
+
+                new_artifact_event = TaskArtifactUpdateEvent(
+                    task_id=context.task_id,
+                    last_chunk=True,
+                    context_id=context.context_id,
+                    artifact=Artifact(
+                        artifact_id=str(uuid.uuid4()),
+                        parts=[TextPart(text=json_text)]
+                    )
+                )
+                await event_queue.enqueue_event(new_artifact_event)
+            else:
+                for ev in interceptor.events:
+                    await event_queue.enqueue_event(ev)
+                if interceptor.artifact_event:
+                    await event_queue.enqueue_event(interceptor.artifact_event)
+        else:
+            for ev in interceptor.events:
+                await event_queue.enqueue_event(ev)
+            if interceptor.artifact_event:
+                await event_queue.enqueue_event(interceptor.artifact_event)
+
+        if interceptor.final_event:
+            await event_queue.enqueue_event(interceptor.final_event)
+
+
+class AgentEngineApp(A2aAgent):
+    @staticmethod
+    def create(
+        app: App | None = None,
+        artifact_service: Any = None,
+        session_service: Any = None,
+    ) -> Any:
+        if app is None:
+            app = adk_app
+
+        def create_runner() -> Runner:
+            return Runner(
+                app=app,
+                session_service=session_service,
+                artifact_service=artifact_service,
+            )
+
+        try:
+            asyncio.get_running_loop()
+            nest_asyncio.apply()
+        except RuntimeError:
+            pass
+
+        agent_card = asyncio.run(AgentEngineApp.build_agent_card(app=app))
+
+        return AgentEngineApp(
+            agent_executor_builder=lambda: AgentEngineA2aExecutor(runner=create_runner()),
+            agent_card=agent_card,
+        )
+
+    @staticmethod
+    async def build_agent_card(app: App) -> AgentCard:
+        agent_name = app.root_agent.name.replace('_', '-') if app.root_agent and hasattr(app.root_agent, "name") else "space-agent"
+        agent_desc = app.root_agent.description if app.root_agent and hasattr(app.root_agent, "description") else "Space Agent"
+        
+        extensions = [
+            AgentExtension(
+                uri="https://google.github.io/adk-docs/a2a/a2a-extension/",
+                description="Ability to use the new agent executor implementation",
+            )
+        ]
+        permissions_data = _load_permissions()
+        if permissions_data:
+            extensions.append(
+                AgentExtension(
+                    uri="https://hubscape.io/extensions/permissions",
+                    description="Workspace role-based permissions matrix",
+                    params=permissions_data
+                )
+            )
+
+        agent_card_builder = AgentCardBuilder(
+            agent=app.root_agent,
+            capabilities=AgentCapabilities(
+                streaming=False,
+                extensions=extensions,
+            ),
+            rpc_url="http://localhost:9999/",
+            agent_version=os.getenv("AGENT_VERSION", "0.1.0"),
+        )
+        agent_card = await agent_card_builder.build()
+        agent_card.name = agent_name
+        agent_card.description = agent_desc
+        agent_card.preferred_transport = TransportProtocol.http_json  # Http Only.
+        agent_card.supports_authenticated_extended_card = True
+        return agent_card
+
     def set_up(self) -> None:
         """Initialize the agent engine app with logging and telemetry."""
         # Undo any pyOpenSSL monkeypatching in urllib3 to avoid connection reuse error
@@ -82,411 +381,39 @@ class AgentEngineApp(AdkApp):
         vertexai.init()
         setup_telemetry()
         super().set_up()
-        if "runner" in self._tmpl_attrs:
-            self._tmpl_attrs["runner"].auto_create_session = True
-        if "in_memory_runner" in self._tmpl_attrs:
-            self._tmpl_attrs["in_memory_runner"].auto_create_session = True
         logging.basicConfig(level=logging.INFO)
         logging_client = google_cloud_logging.Client()
         self.logger = logging_client.logger(__name__)
-
-    def inspect_env(self) -> str:
-        """Inspects environment, credentials, and attempts a direct Gemini call."""
-        import traceback
-        import sys
-        import os
-        
-        token_info = ""
-        try:
-            import google.auth
-            credentials, project = google.auth.default(
-                scopes=['https://www.googleapis.com/auth/cloud-platform']
-            )
-            from google.auth.transport.requests import Request
-            credentials.refresh(Request())
-            token_info = f"Token present: {bool(credentials.token)} (Class: {credentials.__class__.__name__})"
-        except Exception as e:
-            token_info = f"Failed to load credentials: {e}"
-
-        direct_call_status = ""
-        try:
-            from google.genai import Client
-            from app.app_utils.env_resolver import get_project_id, get_region
-            proj_id = get_project_id()
-            loc = get_region()
-            client = Client(vertexai=True, project=proj_id, location=loc)
-            resp = client.models.generate_content(model="gemini-2.5-flash", contents="Hi")
-            direct_call_status = f"SUCCESS: {resp.text[:30]}..."
-        except Exception as e:
-            direct_call_status = f"FAILED: {e.__class__.__name__}: {e}\n{traceback.format_exc()}"
-
-        env_vars = {k: v for k, v in os.environ.items() if not k.endswith("KEY") and "PASSWORD" not in k and "SECRET" not in k}
-        
-        res = f"Python Executable: {sys.executable}\n"
-        res += f"Token Info: {token_info}\n"
-        res += f"Direct Call Status: {direct_call_status}\n"
-        res += f"Environment Variables:\n"
-        for k, v in env_vars.items():
-            res += f"  {k}: {v}\n"
-        return res
-
-    def test_token_access(self) -> str:
-        import google.auth
-        from google.auth.transport.requests import Request
-        import httpx
-        import json
-        
-        res = ""
-        try:
-            credentials, project = google.auth.default(
-                scopes=['https://www.googleapis.com/auth/cloud-platform']
-            )
-            credentials.refresh(Request())
-            token = credentials.token
-            res += f"Token refreshed successfully. Length: {len(token) if token else 0}\n"
-            res += f"Credentials Class: {credentials.__class__.__name__}\n"
-            
-            # Inspect token via tokeninfo
-            try:
-                info_resp = httpx.get(f"https://oauth2.googleapis.com/tokeninfo?access_token={token}")
-                res += f"Tokeninfo Status: {info_resp.status_code}\nTokeninfo: {info_resp.text}\n"
-            except Exception as token_err:
-                res += f"Failed to get token info: {token_err}\n"
-                
-            # Attempt metadata server fetch
-            meta_token = None
-            try:
-                meta_url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
-                meta_resp = httpx.get(meta_url, headers={"Metadata-Flavor": "Google"})
-                res += f"Metadata Server Status: {meta_resp.status_code}\nMetadata Server Response: {meta_resp.text[:300]}\n"
-                if meta_resp.status_code == 200:
-                    meta_token = meta_resp.json().get("access_token")
-            except Exception as meta_err:
-                res += f"Metadata Server Failed: {meta_err}\n"
-                
-            # Attempt card fetch using metadata server token if available, otherwise fallback
-            active_token = meta_token if meta_token else token
-            card_url = "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/1097730318341/locations/us-central1/reasoningEngines/7101814323281920000/a2a/v1/card"
-            headers = {"Authorization": f"Bearer {active_token}"}
-            try:
-                card_resp = httpx.get(card_url, headers=headers)
-                res += f"Card Fetch Status: {card_resp.status_code}\nCard Response: {card_resp.text[:300]}\n"
-            except Exception as card_err:
-                res += f"Failed to fetch card: {card_err}\n"
-                
-        except Exception as e:
-            res += f"Error: {e}\n"
-            import traceback
-            res += traceback.format_exc()
-            
-        return res
 
     def register_feedback(self, feedback: dict[str, Any]) -> None:
         """Collect and log feedback."""
         feedback_obj = Feedback.model_validate(feedback)
         self.logger.log_struct(feedback_obj.model_dump(), severity="INFO")
 
-    def query(self, question: str, context: Optional[dict] = None) -> str:
-        """Non-streaming query delegation to HostAgent."""
-        import asyncio
-        import concurrent.futures
-        from app.agent import host_agent_app
-        
-        async def run_query():
-            return await host_agent_app.query(question, context)
-            
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                return executor.submit(lambda: asyncio.run(run_query())).result()
-        else:
-            return asyncio.run(run_query())
-
-    def stream_query(self, *, message, user_id: str, session_id=None, run_config=None, context: Optional[dict] = None, **kwargs):
-        """Override to initialize RemoteContext, load trajectory, and inject dynamic system instructions."""
-        # --- FAST-PATH ACTION INTERCEPTOR ---
-        if message and message.startswith("/action switchHub"):
-            parts = message.split(" ", 2)
-            if len(parts) >= 2:
-                action_payload = {}
-                if len(parts) == 3:
-                    try:
-                        import json
-                        action_payload = json.loads(parts[2])
-                    except Exception:
-                        pass
-                target_hub = action_payload.get("hubId")
-                if target_hub:
-                    yield {
-                        "content": {
-                            "parts": [{"text": f"Switching context to hub: {target_hub}"}]
-                        },
-                        "actions": [{
-                            "type": "SWITCH_HUB",
-                            "payload": {
-                                "hubId": target_hub
-                            }
-                        }]
-                    }
-                    return
-        
-        
-        import uuid
-        import asyncio
-        import concurrent.futures
-        import hubscape_adk
-        from app.agent import root_agent
-        
-        user_id_resolved = (context or {}).get("userId") or (context or {}).get("user_id") or user_id or "anonymous_user"
-        org_id = (context or {}).get("orgId") or (context or {}).get("org_id")
-        hub_id = (context or {}).get("hubId") or (context or {}).get("hub_id")
-        
-        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
-        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
-        from app.app_utils.env_resolver import get_project_id
-        project_id = get_project_id()
-        
-        remote_ctx = hubscape_adk.RemoteContext(
-            user_id=user_id_resolved,
-            agent_id=agent_uuid,
-            org_id=org_id,
-            hub_id=hub_id,
-            project_id=project_id,
-            raw_context=context
-        )
-        
-        system_instruction = (context or {}).get("system_instruction")
-        if system_instruction:
-            root_agent.instruction = system_instruction
-
-        session_id_resolved = session_id or (context or {}).get("sessionId") or f"session_{user_id_resolved}_{hub_id}"
-
-        with hubscape_adk.context_session(remote_ctx):
-            # Try to restore session trajectory from Firestore using ADK serialization
-            try:
-                session_doc = remote_ctx.get(scope="user", collection_name="sessions", doc_id=session_id_resolved)
-                if session_doc and "adk_session" in session_doc:
-                    adk_session_json = session_doc["adk_session"]
-                    from google.adk.sessions import Session
-                    session_obj = Session.model_validate_json(adk_session_json)
-                    
-                    # Inject loaded session into session service cache
-                    session_service = self._tmpl_attrs.get("session_service")
-                    app_name = adk_app.name
-                    uid = session_obj.user_id
-                    sid = session_obj.id
-                    
-                    if app_name not in session_service.sessions:
-                        session_service.sessions[app_name] = {}
-                    if uid not in session_service.sessions[app_name]:
-                        session_service.sessions[app_name][uid] = {}
-                    session_service.sessions[app_name][uid][sid] = session_obj
-                    print(f"🔄 Resumed ADK GEAP Session in stream_query: {session_id_resolved}")
-                else:
-                    print(f"🌱 Starting New ADK GEAP Session in stream_query: {session_id_resolved}")
-            except Exception as restore_err:
-                print(f"⚠️ Non-critical: Failed to restore session trajectory: {restore_err}")
-
-            # Execute generator
-            yield from super().stream_query(
-                message=message,
-                user_id=user_id,
-                session_id=session_id_resolved,
-                run_config=run_config,
-                **kwargs,
-            )
-
-            # Yield custom actions if any were collected
-            actions = getattr(remote_ctx, "actions", [])
-            if actions:
-                yield {"actions": actions}
-
-            # Retrieve updated session state and persist back to Firestore
-            try:
-                session_service = self._tmpl_attrs.get("session_service")
-                async def fetch_session():
-                    return await session_service.get_session(
-                        app_name=adk_app.name,
-                        user_id=user_id_resolved,
-                        session_id=session_id_resolved
-                    )
-                
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-
-                if loop and loop.is_running():
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        updated_session = executor.submit(lambda: asyncio.run(fetch_session())).result()
-                else:
-                    updated_session = asyncio.run(fetch_session())
-
-                if updated_session:
-                    serialized_json = updated_session.model_dump_json()
-                    remote_ctx.save(
-                        scope="user",
-                        collection_name="sessions",
-                        doc_id=session_id_resolved,
-                        data={
-                            "adk_session": serialized_json
-                        }
-                    )
-                    print(f"💾 Persisted ADK GEAP Session trajectory for {session_id_resolved}")
-            except Exception as save_err:
-                print(f"⚠️ Non-critical: Failed to save session trajectory: {save_err}")
-
-    async def async_stream_query(self, *, message, user_id: str, session_id=None, session_events=None, run_config=None, context: Optional[dict] = None, **kwargs):
-        """Override to initialize RemoteContext, load trajectory, and inject dynamic system instructions."""
-        # --- FAST-PATH ACTION INTERCEPTOR ---
-        if message and message.startswith("/action switchHub"):
-            parts = message.split(" ", 2)
-            if len(parts) >= 2:
-                action_payload = {}
-                if len(parts) == 3:
-                    try:
-                        import json
-                        action_payload = json.loads(parts[2])
-                    except Exception:
-                        pass
-                target_hub = action_payload.get("hubId")
-                if target_hub:
-                    yield {
-                        "content": {
-                            "parts": [{"text": f"Switching context to hub: {target_hub}"}]
-                        },
-                        "actions": [{
-                            "type": "SWITCH_HUB",
-                            "payload": {
-                                "hubId": target_hub
-                            }
-                        }]
-                    }
-                    return
-        
-        
-        import uuid
-        import hubscape_adk
-        from app.agent import root_agent
-        
-        user_id_resolved = (context or {}).get("userId") or (context or {}).get("user_id") or user_id or "anonymous_user"
-        org_id = (context or {}).get("orgId") or (context or {}).get("org_id")
-        hub_id = (context or {}).get("hubId") or (context or {}).get("hub_id")
-        
-        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
-        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
-        from app.app_utils.env_resolver import get_project_id
-        project_id = get_project_id()
-        
-        remote_ctx = hubscape_adk.RemoteContext(
-            user_id=user_id_resolved,
-            agent_id=agent_uuid,
-            org_id=org_id,
-            hub_id=hub_id,
-            project_id=project_id,
-            raw_context=context
-        )
-        
-        system_instruction = (context or {}).get("system_instruction")
-        if system_instruction:
-            root_agent.instruction = system_instruction
-
-        session_id_resolved = session_id or (context or {}).get("sessionId") or f"session_{user_id_resolved}_{hub_id}"
-
-        with hubscape_adk.context_session(remote_ctx):
-            # Try to restore session trajectory from Firestore using ADK serialization
-            try:
-                session_doc = remote_ctx.get(scope="user", collection_name="sessions", doc_id=session_id_resolved)
-                if session_doc and "adk_session" in session_doc:
-                    adk_session_json = session_doc["adk_session"]
-                    from google.adk.sessions import Session
-                    session_obj = Session.model_validate_json(adk_session_json)
-                    
-                    # Inject loaded session into session service cache
-                    session_service = self._tmpl_attrs.get("session_service")
-                    app_name = adk_app.name
-                    uid = session_obj.user_id
-                    sid = session_obj.id
-                    
-                    if app_name not in session_service.sessions:
-                        session_service.sessions[app_name] = {}
-                    if uid not in session_service.sessions[app_name]:
-                        session_service.sessions[app_name][uid] = {}
-                    session_service.sessions[app_name][uid][sid] = session_obj
-                    print(f"🔄 Resumed ADK GEAP Session in async_stream_query: {session_id_resolved}")
-                else:
-                    print(f"🌱 Starting New ADK GEAP Session in async_stream_query: {session_id_resolved}")
-            except Exception as restore_err:
-                print(f"⚠️ Non-critical: Failed to restore session trajectory: {restore_err}")
-
-            async for event in super().async_stream_query(
-                message=message,
-                user_id=user_id,
-                session_id=session_id_resolved,
-                session_events=session_events,
-                run_config=run_config,
-                **kwargs,
-            ):
-                yield event
-
-            # Yield custom actions if any were collected
-            actions = getattr(remote_ctx, "actions", [])
-            if actions:
-                yield {"actions": actions}
-
-            # Retrieve updated session state and persist back to Firestore
-            try:
-                session_service = self._tmpl_attrs.get("session_service")
-                updated_session = await session_service.get_session(
-                    app_name=adk_app.name,
-                    user_id=user_id_resolved,
-                    session_id=session_id_resolved
-                )
-                if updated_session:
-                    serialized_json = updated_session.model_dump_json()
-                    remote_ctx.save(
-                        scope="user",
-                        collection_name="sessions",
-                        doc_id=session_id_resolved,
-                        data={
-                            "adk_session": serialized_json
-                        }
-                    )
-                    print(f"💾 Persisted ADK GEAP Session trajectory for {session_id_resolved}")
-            except Exception as save_err:
-                print(f"⚠️ Non-critical: Failed to save session trajectory: {save_err}")
-
     def get_agent_card(self) -> dict:
         """
-        [NEW] Returns the metadata card of the agent and all its tools.
+        Returns the metadata card of the agent and all its tools.
         Used by the platform Host core during GitOps deploys or sync sweeps.
         """
         from app.agent import app as adk_app
         root_agent = getattr(adk_app, "root_agent", None)
-        
-        # Dynamically load permissions from app/permissions.json
-        import os
-        import json
-        
-        permissions = {}
-        runtime_dir = os.path.dirname(os.path.abspath(__file__))
-        app_dir = os.path.dirname(runtime_dir)
-        permissions_path = os.path.join(app_dir, "permissions.json")
-        
-        if os.path.exists(permissions_path):
-            try:
-                with open(permissions_path, "r") as f:
-                    permissions_data = json.load(f)
-                    permissions = permissions_data.get("permissions", {})
-            except Exception as e:
-                print(f"⚠️ Warning: Failed to parse permissions.json: {e}")
-
         agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "space-agent"
         agent_desc = root_agent.description if root_agent and hasattr(root_agent, "description") else "Space Agent"
+        
+        extensions = [
+            {
+                "uri": "https://google.github.io/adk-docs/a2a/a2a-extension/",
+                "description": "Ability to use the new agent executor implementation"
+            }
+        ]
+        permissions_data = _load_permissions()
+        if permissions_data:
+            extensions.append({
+                "uri": "https://hubscape.io/extensions/permissions",
+                "description": "Workspace role-based permissions matrix",
+                "params": permissions_data
+            })
+
         card_dict = {
             "name": agent_name,
             "description": agent_desc,
@@ -495,16 +422,7 @@ class AgentEngineApp(AdkApp):
             "preferredTransport": "HTTP+JSON",
             "capabilities": {
                 "streaming": False,
-                "extensions": [
-                    {
-                        "uri": "https://hubscape.io/ext/permissions/v1",
-                        "description": "Custom Hubscape RBAC permissions mapping to descriptive access scopes",
-                        "required": False,
-                        "params": {
-                            "permissions": permissions
-                        }
-                    }
-                ]
+                "extensions": extensions
             },
             "skills": [
                 {
@@ -515,7 +433,6 @@ class AgentEngineApp(AdkApp):
             ],
             "tools": []
         }
-        
         tools_list = root_agent.tools if root_agent and hasattr(root_agent, "tools") else []
         for tool_obj in tools_list:
             tool_name = getattr(tool_obj, "__name__", str(tool_obj))
@@ -523,13 +440,12 @@ class AgentEngineApp(AdkApp):
                 "name": tool_name,
                 "description": tool_obj.__doc__ or ""
             })
-            
         return card_dict
 
     def register_operations(self) -> dict[str, list[str]]:
         """Registers the operations of the Agent."""
         operations = super().register_operations()
-        operations[""] = [*operations.get("", []), "register_feedback", "inspect_env", "test_token_access", "query", "get_agent_card"]
+        operations[""] = [*operations.get("", []), "register_feedback", "query", "get_agent_card"]
         return operations
 
     def clone(self) -> "AgentEngineApp":
@@ -539,12 +455,12 @@ class AgentEngineApp(AdkApp):
 
 gemini_location = os.environ.get("GOOGLE_CLOUD_LOCATION")
 logs_bucket_name = os.environ.get("LOGS_BUCKET_NAME")
-agent_runtime = AgentEngineApp(
+agent_runtime = AgentEngineApp.create(
     app=adk_app,
-    artifact_service_builder=lambda: (
+    artifact_service=(
         GcsArtifactService(bucket_name=logs_bucket_name)
         if logs_bucket_name
         else InMemoryArtifactService()
     ),
-    session_service_builder=lambda: InMemorySessionService(),
+    session_service=InMemorySessionService(),
 )
