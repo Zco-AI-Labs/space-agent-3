@@ -445,7 +445,7 @@ class AgentEngineApp(A2aAgent):
     def register_operations(self) -> dict[str, list[str]]:
         """Registers the operations of the Agent."""
         operations = super().register_operations()
-        operations[""] = [*operations.get("", []), "register_feedback", "query", "get_agent_card"]
+        operations[""] = [*operations.get("", []), "register_feedback", "get_agent_card"]
         return operations
 
     def clone(self) -> "AgentEngineApp":
